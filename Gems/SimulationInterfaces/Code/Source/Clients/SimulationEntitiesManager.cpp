@@ -14,6 +14,7 @@
 #include <AzCore/Component/EntityId.h>
 #include <AzCore/Component/TransformBus.h>
 #include <AzCore/Console/IConsole.h>
+#include <AzCore/Math/Capsule.h>
 #include <AzCore/Math/Obb.h>
 #include <AzCore/Outcome/Outcome.h>
 #include <AzCore/RTTI/RTTIMacros.h>
@@ -26,6 +27,8 @@
 #include <AzCore/std/string/regex.h>
 #include <AzCore/std/string/string.h>
 #include <AzFramework/Components/TransformComponent.h>
+#include <AzFramework/Entity/EntityContextBus.h>
+#include <AzFramework/Entity/GameEntityContextBus.h>
 #include <AzFramework/Physics/Common/PhysicsSceneQueries.h>
 #include <AzFramework/Physics/Common/PhysicsSimulatedBody.h>
 #include <AzFramework/Physics/PhysicsSystem.h>
@@ -34,8 +37,6 @@
 #include <AzFramework/Physics/SimulatedBodies/StaticRigidBody.h>
 #include <AzFramework/Spawnable/Spawnable.h>
 #include <AzFramework/Spawnable/SpawnableEntitiesInterface.h>
-#include <AzFramework/Entity/EntityContextBus.h>
-#include <AzFramework/Entity/GameEntityContextBus.h>
 #include <ROS2/Frame/ROS2FrameComponent.h>
 #include <SimulationInterfaces/Bounds.h>
 #include <SimulationInterfaces/Result.h>
@@ -367,6 +368,8 @@ namespace SimulationInterfaces
                 }
             }
 
+            // Allow check for all supported shapes. Simulation interfaces standard constraints are checked in ROS 2 layer of the node.
+
             // for non physical or no-colliding entities check if World TM is inside the control shape
             AZ::Vector3 worldTranslation;
             AZ::TransformBus::EventResult(worldTranslation, entityId, &AZ::TransformBus::Events::GetWorldTranslation);
@@ -387,9 +390,17 @@ namespace SimulationInterfaces
                     entities.push_back(name);
                 }
             }
+            else if (auto capsuleShape = dynamic_cast<Physics::CapsuleShapeConfiguration*>(shape.get()))
+            {
+                const auto capsule = capsuleShape->ToCapsule(shapePose);
+                if (capsule.Contains(worldTranslation))
+                {
+                    entities.push_back(name);
+                }
+            }
             else
             {
-                AZ_Warning("SimulationInterfaces", false, "Unsupported bounds type, skipped");
+                AZ_WarningOnce("SimulationInterfaces", false, "Non-physical entities support only primitive shapes for bounds check");
             }
         }
         return entities;
@@ -761,9 +772,8 @@ namespace SimulationInterfaces
         if (!initialPose.IsOrthogonal())
         {
             AZ_Warning("SimulationInterfaces", false, "Initial pose is not orthogonal");
-            completedCb(
-                AZ::Failure(FailedResult(
-                    simulation_interfaces::srv::SpawnEntity::Response::INVALID_POSE, "Initial pose is not orthogonal"))); //  INVALID_POSE
+            completedCb(AZ::Failure(FailedResult(
+                simulation_interfaces::srv::SpawnEntity::Response::INVALID_POSE, "Initial pose is not orthogonal"))); //  INVALID_POSE
             return;
         }
 
@@ -818,7 +828,11 @@ namespace SimulationInterfaces
                     auto config = frameComponent->GetConfiguration();
                     config.m_namespaceConfiguration.m_customNamespace = entityNamespace;
                     config.m_namespaceConfiguration.m_namespaceStrategy = ROS2::NamespaceConfiguration::NamespaceStrategy::Custom;
-                    AZ_Printf("SimulationInterfaces::SpawnEntity", "Setting namespace to %s for entity %s\n", entityNamespace.c_str(), entity->GetName().c_str());
+                    AZ_Printf(
+                        "SimulationInterfaces::SpawnEntity",
+                        "Setting namespace to %s for entity %s\n",
+                        entityNamespace.c_str(),
+                        entity->GetName().c_str());
                     frameComponent->SetConfiguration(config);
                     break;
                 }
