@@ -233,7 +233,7 @@ namespace ROS2RobotImporter
                 }
                 m_parsedSdf = AZStd::move(parsedSdfOutcome.GetRoot());
                 m_prefabMaker.reset();
-                m_assetNames = Utils::GetReferencedAssetFilenames(m_parsedSdf);
+                m_urdfAssetsMapping = Utils::GetReferencedAssetFilenames(m_parsedSdf);
                 m_assetPage->ClearAssetsList();
             }
             else
@@ -273,6 +273,7 @@ namespace ROS2RobotImporter
         if (currentPage() == m_assetPage)
         {
             FillAssetPage();
+            m_assetPage->SetCopyThread(m_copyReferencedAssetsThread);
         }
         else if (currentPage() == m_prefabMakerPage)
         {
@@ -338,42 +339,31 @@ namespace ROS2RobotImporter
             // Read the SDF Settings from PrefabMakerPage
             const SdfAssetBuilderSettings& sdfBuilderSettings = m_fileSelectPage->GetSdfAssetBuilderSettings();
 
-            if (m_importAssetWithUrdf)
+            Utils::ResolveAssetMap(m_urdfAssetsMapping, m_urdfPath, sdfBuilderSettings);
+            if (!m_copyReferencedAssets)
             {
-                m_urdfAssetsMapping =
-                    AZStd::make_shared<Utils::UrdfAssetMap>(Utils::CreateAssetMap(m_assetNames, m_urdfPath.String(), sdfBuilderSettings));
-            }
-            else
-            {
-                m_urdfAssetsMapping = AZStd::make_shared<Utils::UrdfAssetMap>(
-                    Utils::FindReferencedAssets(m_assetNames, m_urdfPath.String(), sdfBuilderSettings));
-                for (const auto& [assetPath, assetReferenceType] : m_assetNames)
+                Utils::FindReferencedAssets(m_urdfAssetsMapping, m_urdfPath, sdfBuilderSettings);
+                for (const auto& [_, asset] : m_urdfAssetsMapping)
                 {
-                    if (m_urdfAssetsMapping->contains(assetPath))
+                    const bool visual =
+                        (asset.m_assetType & Utils::ReferencedAssetType::VisualMesh) == Utils::ReferencedAssetType::VisualMesh;
+                    const bool collider =
+                        (asset.m_assetType & Utils::ReferencedAssetType::ColliderMesh) == Utils::ReferencedAssetType::ColliderMesh;
+                    if (visual || collider)
                     {
-                        const auto& asset = m_urdfAssetsMapping->at(assetPath);
-                        bool visual =
-                            (assetReferenceType & Utils::ReferencedAssetType::VisualMesh) == Utils::ReferencedAssetType::VisualMesh;
-                        bool collider =
-                            (assetReferenceType & Utils::ReferencedAssetType::ColliderMesh) == Utils::ReferencedAssetType::ColliderMesh;
-                        if (visual || collider)
-                        {
-                            Utils::CreateSceneManifest(asset.m_availableAssetInfo.m_sourceAssetGlobalPath, collider, visual);
-                        }
+                        Utils::CreateSceneManifest(asset.m_availableAssetInfo.m_sourceAssetGlobalPath, collider, visual);
                     }
                 }
             };
 
-            for (auto& [unresolvedFileName, urdfAsset] : *m_urdfAssetsMapping)
+            for (auto& [unresolvedFileName, asset] : m_urdfAssetsMapping)
             {
                 QString type = tr("Unknown");
 
-                bool visual =
-                    (urdfAsset.m_assetReferenceType & Utils::ReferencedAssetType::VisualMesh) == Utils::ReferencedAssetType::VisualMesh;
-                bool collider =
-                    (urdfAsset.m_assetReferenceType & Utils::ReferencedAssetType::ColliderMesh) == Utils::ReferencedAssetType::ColliderMesh;
-                bool texture =
-                    (urdfAsset.m_assetReferenceType & Utils::ReferencedAssetType::Texture) == Utils::ReferencedAssetType::Texture;
+                const bool visual = (asset.m_assetType & Utils::ReferencedAssetType::VisualMesh) == Utils::ReferencedAssetType::VisualMesh;
+                const bool collider =
+                    (asset.m_assetType & Utils::ReferencedAssetType::ColliderMesh) == Utils::ReferencedAssetType::ColliderMesh;
+                const bool texture = (asset.m_assetType & Utils::ReferencedAssetType::Texture) == Utils::ReferencedAssetType::Texture;
                 if (visual && collider)
                 {
                     type = tr("Visual and Collider Mesh");
@@ -391,10 +381,10 @@ namespace ROS2RobotImporter
                     type = tr("Texture");
                 }
 
-                m_assetPage->ReportAsset(unresolvedFileName.c_str(), urdfAsset, type);
+                m_assetPage->ReportAsset(unresolvedFileName.c_str(), asset, type);
             }
             m_refreshTimerCheckAssets->start();
-            if (m_importAssetWithUrdf)
+            if (m_copyReferencedAssets)
             {
                 m_copyReferencedAssetsThread = AZStd::make_shared<AZStd::thread>(
                     [this, dirSuffix]()
@@ -407,23 +397,32 @@ namespace ROS2RobotImporter
                             return;
                         }
                         AZStd::unordered_map<AZ::IO::Path, unsigned int> duplicatedFilenames;
-                        for (auto& [unresolvedFileName, urdfAsset] : *m_urdfAssetsMapping)
+                        for (auto& [unresolvedFileName, urdfAsset] : m_urdfAssetsMapping)
                         {
-                            if (duplicatedFilenames.contains(unresolvedFileName))
+                            if (duplicatedFilenames.contains(urdfAsset.m_assetUri))
                             {
-                                duplicatedFilenames[unresolvedFileName]++;
+                                duplicatedFilenames[urdfAsset.m_assetUri]++;
                             }
                             else
                             {
-                                duplicatedFilenames[unresolvedFileName] = 0;
+                                duplicatedFilenames[urdfAsset.m_assetUri] = 0;
                             }
                             if (urdfAsset.m_copyStatus == Utils::CopyStatus::Waiting)
                             {
                                 m_assetPage->OnAssetCopyStatusChanged(
                                     Utils::CopyStatus::Copying, AZStd::string(unresolvedFileName.c_str()), "");
                             }
-                            auto copyStatus = Utils::CopyReferencedAsset(
-                                unresolvedFileName, destStatus.GetValue(), urdfAsset, duplicatedFilenames[unresolvedFileName]);
+
+                            auto copyStatus = Utils::CopyStatus::Unresolvable;
+                            if (urdfAsset.m_resolvedUrdfPath.empty())
+                            {
+                                AZ_Warning("CopyAssetForURDF", false, "There is no resolved path for %s", unresolvedFileName.c_str());
+                            }
+                            else
+                            {
+                                copyStatus =
+                                    Utils::CopyReferencedAsset(destStatus.GetValue(), urdfAsset, duplicatedFilenames[urdfAsset.m_assetUri]);
+                            }
 
                             m_assetPage->OnAssetCopyStatusChanged(
                                 copyStatus,
@@ -473,7 +472,7 @@ namespace ROS2RobotImporter
         AZStd::set<AZ::IO::Path> processedAssets;
         for (auto& assetToProcessPath : m_toProcessAssets)
         {
-            auto urdfAsset = m_urdfAssetsMapping->find(assetToProcessPath)->second;
+            auto urdfAsset = m_urdfAssetsMapping.find(assetToProcessPath)->second;
             auto assetFinishedOutcome = CheckIfAssetFinished(urdfAsset.m_availableAssetInfo.m_sourceAssetGlobalPath.c_str());
 
             if (assetFinishedOutcome.IsSuccess())
@@ -520,16 +519,16 @@ namespace ROS2RobotImporter
                 m_xacroParamsPage->SetXacroParameters(m_params);
             }
             // no need to wait for param page - parse urdf now, nextId will skip unnecessary pages
-            if (const bool isFileXacroUrdfOrSdf = Utils::IsFileXacroOrUrdfOrSdf(m_urdfPath); m_params.empty() && isFileXacroUrdfOrSdf)
+            if (m_params.empty() && Utils::IsFileXacroOrUrdfOrSdf(m_urdfPath))
             {
                 OpenUrdf();
             }
-            m_importAssetWithUrdf = m_fileSelectPage->GetSdfAssetBuilderSettings().m_importReferencedMeshFiles;
+            m_copyReferencedAssets = m_fileSelectPage->GetSdfAssetBuilderSettings().m_importReferencedMeshFiles;
         }
         if (currentPage() == m_xacroParamsPage)
         {
             m_params = m_xacroParamsPage->GetXacroParameters();
-            if (const bool isFileXacroUrdfOrSdf = Utils::IsFileXacroOrUrdfOrSdf(m_urdfPath); isFileXacroUrdfOrSdf)
+            if (Utils::IsFileXacroOrUrdfOrSdf(m_urdfPath))
             {
                 OpenUrdf();
             }
@@ -557,13 +556,6 @@ namespace ROS2RobotImporter
 
     int RobotImporterWidget::nextId() const
     {
-        if (currentPage() == m_assetPage)
-        {
-            if (m_copyReferencedAssetsThread)
-            {
-                m_copyReferencedAssetsThread->join();
-            }
-        }
         if ((currentPage() == m_fileSelectPage && m_params.empty()) || currentPage() == m_xacroParamsPage)
         {
             if (m_robotDescriptionPage->isComplete())
@@ -573,7 +565,7 @@ namespace ROS2RobotImporter
                     // do not skip robot description page
                     return m_xacroParamsPage->nextId();
                 }
-                if (m_assetNames.empty())
+                if (m_urdfAssetsMapping.empty())
                 {
                     // skip two pages when urdf/sdf is parsed without problems, and it has no assets
                     return m_assetPage->nextId();
@@ -623,10 +615,9 @@ namespace ROS2RobotImporter
         const auto& sdfAssetBuilderSettings = m_fileSelectPage->GetSdfAssetBuilderSettings();
         const bool useArticulation = sdfAssetBuilderSettings.m_useArticulations;
         m_prefabMaker = AZStd::make_unique<URDFPrefabMaker>(
-            m_urdfPath.String(),
             &m_parsedSdf,
             prefabPath.String(),
-            m_urdfAssetsMapping,
+            AZStd::make_shared<Utils::UrdfAssetMap>(m_urdfAssetsMapping),
             useArticulation,
             m_prefabMakerPage->getSelectedSpawnPoint());
 
