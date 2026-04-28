@@ -7,6 +7,7 @@
  */
 
 #include "SpawnEntityServiceHandler.h"
+#include "SpawnServiceUtils.h"
 #include <AzFramework/Physics/ShapeConfiguration.h>
 #include <ROS2/ROS2Bus.h>
 #include <ROS2/TF/TransformInterface.h>
@@ -26,14 +27,18 @@ namespace ROS2SimulationInterfaces
         const std::shared_ptr<rmw_request_id_t> header, const Request& request)
     {
         const AZStd::string_view name{ request.name.c_str(), request.name.size() };
+#if SIMULATION_INTERFACES_MAJOR_API_VERSION >= 2
+        const AZStd::string_view uri{ request.entity_resource.uri.c_str(), request.entity_resource.uri.size() };
+#else
         const AZStd::string_view uri{ request.uri.c_str(), request.uri.size() };
+#endif
         const AZStd::string_view entityNamespace{ request.entity_namespace.c_str(), request.entity_namespace.size() };
         const AZStd::string_view messageFrameId{ request.initial_pose.header.frame_id.c_str(),
                                                  request.initial_pose.header.frame_id.size() };
         const builtin_interfaces::msg::Time zeroTime = builtin_interfaces::msg::Time();
 
         // Validate entity name
-        if (!name.empty() && !ValidateEntityName(name))
+        if (!name.empty() && !SpawnServiceUtils::ValidateEntityName(name))
         {
             Response response;
             response.result.result = simulation_interfaces::srv::SpawnEntity::Response::NAME_INVALID;
@@ -43,7 +48,7 @@ namespace ROS2SimulationInterfaces
         }
 
         // Validate namespace name
-        if (!entityNamespace.empty() && !ValidateNamespaceName(entityNamespace))
+        if (!entityNamespace.empty() && !SpawnServiceUtils::ValidateNamespaceName(entityNamespace))
         {
             Response response;
             response.result.result = simulation_interfaces::srv::SpawnEntity::Response::NAMESPACE_INVALID;
@@ -71,11 +76,24 @@ namespace ROS2SimulationInterfaces
                 Response response;
                 response.result.result = simulation_interfaces::msg::Result::RESULT_OPERATION_FAILED;
                 response.result.error_message = transformOutcome.GetError().c_str();
-                return response;
+                SendResponse(response);
+                return AZStd::nullopt;
             }
         }
 
-        const AZ::Transform initialPose = transformOffset * ROS2::ROS2Conversions::FromROS2Pose(request.initial_pose.pose);
+        const AZ::Transform requestedPose = ROS2::ROS2Conversions::FromROS2Pose(request.initial_pose.pose);
+        if (const auto poseValidation = SpawnServiceUtils::ValidateTransformNormalized(requestedPose); !poseValidation.IsSuccess())
+        {
+            Response response;
+            response.result.result = simulation_interfaces::srv::SpawnEntity::Response::INVALID_POSE;
+            response.result.error_message = poseValidation.GetError().c_str();
+            SendResponse(response);
+            return AZStd::nullopt;
+        }
+
+        const AZ::Transform initialPose = transformOffset *
+            AZ::Transform::CreateFromQuaternionAndTranslation(requestedPose.GetRotation().GetNormalized(), requestedPose.GetTranslation());
+
         SimulationInterfaces::PreInsertionCb preinsertionCB =
             [this](const AZ::Outcome<AzFramework::SpawnableEntityContainerView, SimulationInterfaces::FailedResult>& outcome)
         {
@@ -114,20 +132,6 @@ namespace ROS2SimulationInterfaces
                 SendResponse(response);
             });
         return AZStd::nullopt;
-    }
-
-    bool SpawnEntityServiceHandler::ValidateEntityName(const AZStd::string& entityName)
-    {
-        const AZStd::regex entityRegex{ R"(^[a-zA-Z0-9_]+$)" }; // Entity names can only contain alphanumeric characters and underscores
-        return AZStd::regex_match(entityName, entityRegex);
-    }
-
-    bool SpawnEntityServiceHandler::ValidateNamespaceName(const AZStd::string& namespaceName)
-    {
-        const AZStd::regex namespaceRegex{
-            R"(^[a-zA-Z0-9_/]+$)"
-        }; // Namespace names can only contain alphanumeric characters and underscores and forward slashes
-        return AZStd::regex_match(namespaceName, namespaceRegex);
     }
 
 } // namespace ROS2SimulationInterfaces
