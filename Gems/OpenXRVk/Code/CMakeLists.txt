@@ -65,7 +65,7 @@ ly_add_target(
             Gem::Atom_RHI_Vulkan.Reflect
             Gem::Atom_RHI_Vulkan.Glad.Static
             Gem::XR.Static
-            Gem::PhysX.Static			
+            Gem::PhysX5.Static
             Gem::Atom_Feature_Common.Public			
             Gem::CommonFeaturesAtom.Static
             Gem::EMotionFXStaticLib

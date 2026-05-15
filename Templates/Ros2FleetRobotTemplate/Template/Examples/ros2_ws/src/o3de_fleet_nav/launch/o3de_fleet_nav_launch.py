@@ -20,7 +20,7 @@ from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
-                            IncludeLaunchDescription, LogInfo)
+                            IncludeLaunchDescription, LogInfo, SetEnvironmentVariable)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, TextSubstitution
@@ -41,10 +41,15 @@ def generate_launch_description():
             robots.append(
                 {
                     "name": robot["robot_name"],
+                    "uri": robot["robot_uri"],
                     "namespace": robot["robot_namespace"],
                     "x_pose": robot["position"]["x"],
                     "y_pose": robot["position"]["y"],
-                    "z_pose": robot["position"]["z"]
+                    "z_pose": robot["position"]["z"],
+                    "x_orientation": robot["orientation"]["x"],
+                    "y_orientation": robot["orientation"]["y"],
+                    "z_orientation": robot["orientation"]["z"],
+                    "w_orientation": robot["orientation"]["w"]
                 }
             )
 
@@ -55,6 +60,13 @@ def generate_launch_description():
     log_settings = LaunchConfiguration('log_settings', default='true')
 
     distro = os.getenv('ROS_DISTRO')
+
+    cyclonedds_uri = (
+        '<CycloneDDS><Domain id="any"><Discovery>'
+        '<ParticipantIndex>auto</ParticipantIndex>'
+        '<MaxAutoParticipantIndex>256</MaxAutoParticipantIndex>'
+        '</Discovery></Domain></CycloneDDS>'
+    )
 
     # Declare the launch arguments
     declare_map_yaml_cmd = DeclareLaunchArgument(
@@ -90,10 +102,15 @@ def generate_launch_description():
             source_file=params_file,
             replacements={
                 '<robot_name>': robot['name'],
+                '<robot_uri>': robot['uri'],
                 '<robot_namespace>': robot['namespace'],
                 '<robot_initial_pose_x>': str(robot['x_pose']),
                 '<robot_initial_pose_y>': str(robot['y_pose']),
-                '<robot_initial_pose_z>': str(robot['z_pose'])
+                '<robot_initial_pose_z>': str(robot['z_pose']),
+                '<robot_initial_orientation_x>': str(robot['x_orientation']),
+                '<robot_initial_orientation_y>': str(robot['y_orientation']),
+                '<robot_initial_orientation_z>': str(robot['z_orientation']),
+                '<robot_initial_orientation_w>': str(robot['w_orientation'])
             })
         
 
@@ -147,6 +164,12 @@ def generate_launch_description():
     ld.add_action(declare_rviz_config_file_cmd)
 
     # Launch robots
+    # Multi-robot Nav2 can exhaust the default Cyclone DDS participant index
+    # range. Set a higher default only when the user has not provided a
+    # CYCLONEDDS_URI.
+    if 'CYCLONEDDS_URI' not in os.environ:
+        ld.add_action(SetEnvironmentVariable('CYCLONEDDS_URI', cyclonedds_uri))
+
     for simulation_instance_cmd in nav_instances_cmds:
         ld.add_action(simulation_instance_cmd)
 
