@@ -15,6 +15,7 @@
 #include <AzCore/Component/TransformBus.h>
 #include <AzCore/Debug/Trace.h>
 #include <AzCore/Serialization/EditContext.h>
+#include <AzCore/std/optional.h>
 #include <ROS2/Clock/ROS2ClockRequestBus.h>
 #include <ROS2/Frame/ROS2FrameComponent.h>
 #include <ROS2/Utilities/ROS2Conversions.h>
@@ -28,48 +29,36 @@ namespace ROS2Controllers
 {
     namespace Internal
     {
-        void Add1DOFJointInfo(const AZ::EntityComponentIdPair& idPair, const AZStd::string& jointName, ManipulationJoints& joints)
+        JointInfo Get1DOFJointInfo(const AZ::EntityComponentIdPair& idPair)
         {
-            if (joints.find(jointName) != joints.end())
-            {
-                AZ_Assert(false, "Joint names in hierarchy need to be unique (%s is not)!", jointName.c_str());
-                return;
-            }
             JointInfo jointInfo;
             jointInfo.m_isArticulation = false;
             jointInfo.m_axis = static_cast<PhysX::ArticulationJointAxis>(0);
             jointInfo.m_entityComponentIdPair = idPair;
-            joints[jointName] = jointInfo;
+            return jointInfo;
         }
 
-        void AddArticulationJointInfo(const AZ::EntityComponentIdPair& idPair, const AZStd::string& jointName, ManipulationJoints& joints)
+        AZStd::optional<JointInfo> GetArticulationJointInfo(const AZ::EntityComponentIdPair& idPair)
         {
             bool isRoot = false;
             PhysX::ArticulationJointRequestBus::EventResult(
                 isRoot, idPair.GetEntityId(), &PhysX::ArticulationJointRequests::IsRootArticulation);
             if (isRoot)
             { // Root articulation does not have a joint
-                return;
+                return AZStd::nullopt;
             }
 
             const auto freeAxis = Utils::TryGetFreeArticulationAxis(idPair.GetEntityId());
             if (!freeAxis.has_value())
             { // Do not add a joint since it is a fixed one
-                return;
-            }
-
-            if (joints.find(jointName) != joints.end())
-            {
-                AZ_Error(
-                    "JointsManipulationComponent", false, "Joint names in hierarchy need to be unique (%s is not)!", jointName.c_str());
-                return;
+                return AZStd::nullopt;
             }
 
             JointInfo jointInfo;
             jointInfo.m_isArticulation = true;
             jointInfo.m_axis = freeAxis.value();
             jointInfo.m_entityComponentIdPair = idPair;
-            joints[jointName] = jointInfo;
+            return jointInfo;
         }
 
         ManipulationJoints GetAllEntityHierarchyJoints(const AZ::EntityId& entityId)
@@ -109,7 +98,12 @@ namespace ROS2Controllers
                 { // Frame Component is required for joints.
                     continue;
                 }
-                const AZStd::string jointName(frameComponent->GetJointName().c_str());
+                const AZStd::string jointName(frameComponent->GetNamespacedJointName().c_str());
+                if (manipulationJoints.find(jointName) != manipulationJoints.end())
+                {
+                    AZ_Assert(false, "Joint names in hierarchy need to be unique (%s is not)!", jointName.c_str());
+                    return {};
+                }
 
                 auto* hingeComponent = entity->FindComponent<PhysX::HingeJointComponent>();
                 auto* prismaticComponent = entity->FindComponent<PhysX::PrismaticJointComponent>();
@@ -128,21 +122,25 @@ namespace ROS2Controllers
                 if (supportsClassicJoints && hingeComponent)
                 {
                     auto idPair = AZ::EntityComponentIdPair(hingeComponent->GetEntityId(), hingeComponent->GetId());
-                    Internal::Add1DOFJointInfo(idPair, jointName, manipulationJoints);
+                    manipulationJoints[jointName] = Get1DOFJointInfo(idPair);
                 }
 
                 // See if there is a Prismatic Joint in the entity, add it to map.
                 if (supportsClassicJoints && prismaticComponent)
                 {
                     auto idPair = AZ::EntityComponentIdPair(prismaticComponent->GetEntityId(), prismaticComponent->GetId());
-                    Internal::Add1DOFJointInfo(idPair, jointName, manipulationJoints);
+                    manipulationJoints[jointName] = Get1DOFJointInfo(idPair);
                 }
 
                 // See if there is an Articulation Link in the entity, add it to map.
                 if (supportsArticulation && articulationComponent)
                 {
                     auto idPair = AZ::EntityComponentIdPair(articulationComponent->GetEntityId(), articulationComponent->GetId());
-                    Internal::AddArticulationJointInfo(idPair, jointName, manipulationJoints);
+                    auto jointInfo = GetArticulationJointInfo(idPair);
+                    if (jointInfo)
+                    {
+                        manipulationJoints[jointName] = *jointInfo;
+                    }
                 }
             }
             return manipulationJoints;
@@ -160,7 +158,7 @@ namespace ROS2Controllers
                 }
                 else
                 {
-                    AZ_Warning("JointsManipulationComponent", false, "No joint %s to set initial position", jointName.c_str());
+                    AZ_Warning("JointsManipulationComponent", false, "Initial position not set for joint %s", jointName.c_str());
                 }
             }
         }
@@ -389,26 +387,34 @@ namespace ROS2Controllers
         for (const auto& [jointName, jointInfo] : m_manipulationJoints)
         {
             float currentPosition = GetJointPosition(jointName).GetValue();
-            float desiredPosition = jointInfo.m_restPosition;
+            auto desiredPosition = jointInfo.m_restPosition;
 
-            AZ::Outcome<void, AZStd::string> positionControlOutcome;
-            JointsPositionControllerRequestBus::EventResult(
-                positionControlOutcome,
-                GetEntityId(),
-                &JointsPositionControllerRequests::PositionControl,
-                jointName,
-                jointInfo,
-                currentPosition,
-                desiredPosition,
-                deltaTime);
-
-            AZ_Warning(
-                "JointsManipulationComponent",
-                positionControlOutcome,
-                "Position control failed for joint %s (%s): %s",
-                jointName.c_str(),
-                jointInfo.m_entityComponentIdPair.GetEntityId().ToString().c_str(),
-                positionControlOutcome.GetError().c_str());
+            if (desiredPosition.has_value())
+            {
+                AZ::Outcome<void, AZStd::string> positionControlOutcome;
+                JointsPositionControllerRequestBus::EventResult(
+                    positionControlOutcome,
+                    GetEntityId(),
+                    &JointsPositionControllerRequests::PositionControl,
+                    jointName,
+                    jointInfo,
+                    currentPosition,
+                    *desiredPosition,
+                    deltaTime);
+                if (positionControlOutcome.IsSuccess())
+                {
+                    // no need to update desired position, it will be updated on the next MoveJointToPosition call.
+                    // If the position is reached and there is no new desired position, the controller should keep the joint in place.
+                    desiredPosition = AZStd::nullopt; // If control failed, do not update desired position, try again in the next tick.
+                }
+                AZ_Warning(
+                    "JointsManipulationComponent",
+                    positionControlOutcome,
+                    "Position control failed for joint %s (%s): %s",
+                    jointName.c_str(),
+                    jointInfo.m_entityComponentIdPair.GetEntityId().ToString().c_str(),
+                    positionControlOutcome.GetError().c_str());
+            }
         }
     }
 
@@ -425,6 +431,14 @@ namespace ROS2Controllers
     {
         if (m_manipulationJoints.empty())
         {
+            AZStd::string namespaceFromFrame;
+            ROS2::ROS2FrameComponentBus::EventResult(namespaceFromFrame, m_entity->GetId(), &ROS2::ROS2FrameComponentRequests::GetNamespace);
+
+            for (auto & [jointName, position] : m_initialPositions)
+            {
+                // apply namespace to the joint names in the configuration
+                ROS2::ROS2NamesRequestBus::BroadcastResult(jointName, &ROS2::ROS2NamesRequests::GetNamespacedName, namespaceFromFrame, jointName);
+            }
             m_manipulationJoints = Internal::GetAllEntityHierarchyJoints(GetEntityId());
             Internal::SetInitialPositions(m_manipulationJoints, m_initialPositions);
             if (m_manipulationJoints.empty())
